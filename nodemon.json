@@ -1,0 +1,11 @@
+{
+  "restartable": "rs",
+  "ignore": ["node_modules"],
+  "verbose": true,
+  "execMap": {
+    "js": "node"
+  },
+  "watch": ["."],
+  "ext": "js,json",
+  "delay": "1500"
+}
