@@ -4,7 +4,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const qrcode = require("qrcode");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const fs = require("fs").promises;
 const path = require("path");
 const { type } = require("os");
@@ -17,12 +17,70 @@ const FRONTEND_ORIGIN =
 const AUTH_FOLDER_PATH = path.join(__dirname, "www_auth");
 
 const app = express();
-app.use(cors({ origin: FRONTEND_ORIGIN }));
+
+// More flexible CORS configuration for production
+const allowedOrigins = [
+  FRONTEND_ORIGIN,
+  "https://clinic-crm-sigma.vercel.app",
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://localhost:4173"
+];
+
+app.use(cors({ 
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log('CORS blocked origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    socketConnections: io.engine.clientsCount,
+    whatsappStatus: isClientReady ? 'ready' : 'not_ready'
+  });
+});
+
+// Socket connection info endpoint
+app.get('/socket-info', (req, res) => {
+  res.json({
+    socketUrl: `ws://${req.get('host')}`,
+    allowedOrigins: allowedOrigins,
+    corsEnabled: true
+  });
+});
+
+// Media test endpoint
+app.get('/media-test', (req, res) => {
+  res.json({
+    message: 'Media handling is enabled',
+    supportedTypes: ['image', 'video', 'audio', 'document'],
+    features: ['download', 'send', 'display']
+  });
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: FRONTEND_ORIGIN, methods: ["GET", "POST"] },
+  cors: { 
+    origin: allowedOrigins, 
+    methods: ["GET", "POST"],
+    credentials: true
+  },
 });
 
 // ---------- State ----------
@@ -74,14 +132,24 @@ function setupClientEventHandlers() {
     isClientReady = true;
     io.emit("status", "ready");
 
-    setTimeout(async () => {
-      try {
-        const chats = await getFormattedChats();
-        io.emit("chats", chats);
-      } catch (err) {
-        console.error("[WA] Failed to fetch chats on ready:", err);
-      }
-    }, 2000); // wait 2s before fetching
+    // Fetch chats immediately instead of waiting 2 seconds
+    try {
+      console.log("[WA] Fetching chats immediately...");
+      const chats = await getFormattedChats();
+      console.log(`[WA] Fetched ${chats.length} chats`);
+      io.emit("chats", chats);
+    } catch (err) {
+      console.error("[WA] Failed to fetch chats on ready:", err);
+      // Retry after a short delay if first attempt fails
+      setTimeout(async () => {
+        try {
+          const chats = await getFormattedChats();
+          io.emit("chats", chats);
+        } catch (retryErr) {
+          console.error("[WA] Retry failed to fetch chats:", retryErr);
+        }
+      }, 1000);
+    }
   });
 
   client.on("disconnected", async (reason) => {
@@ -130,14 +198,14 @@ function setupClientEventHandlers() {
 
     try {
       console.log(
-        `[WA] New Message recieved/Sent for chat: ${
+        `[WA] New Message received/Sent for chat: ${
           msg.fromMe ? msg.to : msg.from
-        }`
+        }, type: ${msg.type}, hasMedia: ${msg.hasMedia}`
       );
 
       const simplifiedMessage = {
         id: msg.id._serialized,
-        body: msg.body,
+        body: msg.body || "",
         fromMe: msg.fromMe,
         timestamp: msg.timestamp,
         hasMedia: msg.hasMedia,
@@ -145,6 +213,25 @@ function setupClientEventHandlers() {
         ack: msg.ack,
         media: null,
       };
+
+      // Handle media in real-time messages
+      if (msg.hasMedia && msg.type) {
+        try {
+          console.log(`[WA] Downloading media for new message ${simplifiedMessage.id}`);
+          const media = await msg.downloadMedia();
+          if (media && media.data) {
+            simplifiedMessage.media = {
+              mimetype: media.mimetype,
+              data: media.data,
+              filename: media.filename || `media_${Date.now()}`,
+              size: media.filesize || 0,
+            };
+            console.log(`[WA] Media downloaded for new message ${simplifiedMessage.id}`);
+          }
+        } catch (mediaErr) {
+          console.error(`[WA] Error downloading media for new message ${simplifiedMessage.id}:`, mediaErr);
+        }
+      }
 
       io.emit("new_message", {
         chatId: msg.fromMe ? msg.to : msg.from,
@@ -200,13 +287,19 @@ async function initializeClientIfNeeded() {
   }
 }
 
-// Added retries and delay to avoid puppeteer not ready errors
+// Optimized chat fetching with better error handling
 async function getFormattedChats(retries = 3) {
-  if (!isClientReady || !client) return [];
+  if (!isClientReady || !client) {
+    console.log("[WA] getFormattedChats: Client not ready");
+    return [];
+  }
 
   try {
+    console.log("[WA] Fetching chats from WhatsApp...");
     const chats = await client.getChats();
-    return chats.map((chat) => ({
+    console.log(`[WA] Raw chats received: ${chats.length}`);
+    
+    const formattedChats = chats.slice(0, 50).map((chat) => ({
       id: chat.id._serialized,
       name:
         chat.name ||
@@ -222,16 +315,24 @@ async function getFormattedChats(retries = 3) {
         (chat.lastMessage?.hasMedia ? "📷 Media" : "") ||
         "",
     }));
+    
+    console.log(`[WA] Formatted ${formattedChats.length} chats`);
+    return formattedChats;
   } catch (err) {
+    console.error("[WA] getFormattedChats error:", err.message);
+    
     if (String(err.message).includes("Session closed")) {
       console.warn("[WA] getFormattedChats skipped - session already closed.");
       return [];
     }
+    
     if (retries > 0) {
-      await new Promise((res) => setTimeout(res, 1000));
+      console.log(`[WA] Retrying getFormattedChats (${retries} attempts left)`);
+      await new Promise((res) => setTimeout(res, 500)); // Reduced delay
       return getFormattedChats(retries - 1);
     }
-    console.error("[WA] getFormattedChats error", err);
+    
+    console.error("[WA] getFormattedChats failed after all retries");
     return [];
   }
 }
@@ -254,7 +355,14 @@ io.on("connection", (socket) => {
 
   // Immediately emit current status & QR on connect
   if (isClientReady) {
+    console.log("[IO] Client is ready, sending status and fetching chats...");
     socket.emit("status", "ready");
+    // Fetch and send chats immediately
+    getFormattedChats().then(chats => {
+      socket.emit("chats", chats);
+    }).catch(err => {
+      console.error("[IO] Error fetching chats on connect:", err);
+    });
   } else if (lastQrDataUrl) {
     socket.emit("qr", lastQrDataUrl);
     socket.emit("status", "qr_received");
@@ -266,13 +374,19 @@ io.on("connection", (socket) => {
     console.log("[IO] received request-initial-status from", socket.id);
     if (isClientReady) {
       try {
+        console.log("[IO] Client is ready, fetching chats for initial status...");
         const chats = await getFormattedChats();
+        console.log(`[IO] Sending ${chats.length} chats in initial status`);
         socket.emit("initial-status", { ready: true, chats });
+        // Also emit chats separately to ensure frontend receives them
+        socket.emit("chats", chats);
       } catch (err) {
         console.error("[IO] Error fetching chats for initial status", err);
         socket.emit("initial-status", { ready: true, chats: [] });
+        socket.emit("chats", []);
       }
     } else {
+      console.log("[IO] Client not ready, sending QR status");
       socket.emit("initial-status", { ready: false, qr: lastQrDataUrl });
     }
   });
@@ -310,17 +424,46 @@ io.on("connection", (socket) => {
         return;
       }
       const msgs = await chat.fetchMessages({ limit: 100 });
-      const simplified = msgs
-        .map((m) => ({
-          id: m.id?._serialized || `${m.timestamp}-${Math.random()}`,
-          body: m.body,
-          fromMe: !!m.fromMe,
-          timestamp: m.timestamp || Math.floor(Date.now() / 1000),
-          hasMedia: m.hasMedia || false,
-          type: m.type || null,
-          ack: m.ack,
-        }))
-        .filter((m) => m.type !== "revoked");
+      const simplified = await Promise.all(
+        msgs
+          .filter((m) => m.type !== "revoked")
+          .map(async (m) => {
+            const messageData = {
+              id: m.id?._serialized || `${m.timestamp}-${Math.random()}`,
+              body: m.body || "",
+              fromMe: !!m.fromMe,
+              timestamp: m.timestamp || Math.floor(Date.now() / 1000),
+              hasMedia: m.hasMedia || false,
+              type: m.type || null,
+              ack: m.ack,
+              media: null,
+            };
+
+            // Handle media messages
+            if (m.hasMedia && m.type) {
+              try {
+                console.log(`[IO] Downloading media for message ${messageData.id}, type: ${m.type}`);
+                const media = await m.downloadMedia();
+                if (media && media.data) {
+                  messageData.media = {
+                    mimetype: media.mimetype,
+                    data: media.data,
+                    filename: media.filename || `media_${Date.now()}`,
+                    size: media.filesize || 0,
+                  };
+                  console.log(`[IO] Media downloaded successfully for message ${messageData.id}`);
+                }
+              } catch (mediaErr) {
+                console.error(`[IO] Error downloading media for message ${messageData.id}:`, mediaErr);
+                messageData.media = null;
+              }
+            }
+
+            return messageData;
+          })
+      );
+      
+      console.log(`[IO] Sending ${simplified.length} messages with media support`);
       socket.emit("chat-messages", { chatId, messages: simplified });
     } catch (err) {
       console.error("[IO] get-chat-messages error", err);
@@ -373,11 +516,10 @@ io.on("connection", (socket) => {
   socket.on("send-message", async (data) => {
     try {
       // 1. Destructure all the data sent from the frontend, including the temporary ID.
-      const { chatId, message, tempId } = data;
+      const { chatId, message, tempId, media } = data;
 
       if (!isClientReady || !client) {
         console.warn("[WA] Send message attempt when client not ready.");
-        // Optionally, you can emit an error back to this specific client
         socket.emit("send_message_error", {
           tempId,
           error: "WhatsApp client not ready.",
@@ -385,32 +527,41 @@ io.on("connection", (socket) => {
         return;
       }
 
+      let sentMessage;
+
       // 2. Send the message using the library. This returns the final Message object.
-      const sentMessage = await client.sendMessage(chatId, message);
+      if (media && media.data) {
+        // Send media message
+        console.log(`[WA] Sending media message to ${chatId}`);
+        const mediaBuffer = Buffer.from(media.data, 'base64');
+        const mediaMessage = new MessageMedia(media.mimetype, media.data, media.filename);
+        sentMessage = await client.sendMessage(chatId, mediaMessage, { caption: message || "" });
+      } else {
+        // Send text message
+        sentMessage = await client.sendMessage(chatId, message);
+      }
 
       // 3. Create a clean, simplified payload with all necessary info for the UI.
       const confirmationPayload = {
         id: sentMessage.id._serialized,
-        body: sentMessage.body,
+        body: sentMessage.body || message || "",
         fromMe: sentMessage.fromMe,
         timestamp: sentMessage.timestamp,
         hasMedia: sentMessage.hasMedia,
         type: sentMessage.type,
-        ack: sentMessage.ack, // This will be the initial 'sent' status (ack: 1)
+        ack: sentMessage.ack,
+        media: media || null,
       };
 
       // 4. Emit a confirmation event *back to the sender* (using socket.emit).
-      //    Include the original tempId so the frontend knows which optimistic message to replace.
       socket.emit("message_sent_confirmation", {
         tempId: tempId,
         message: confirmationPayload,
       });
 
-      console.log(`[WA] Sent message to ${chatId}: ${message}`);
+      console.log(`[WA] Sent ${media ? 'media' : 'text'} message to ${chatId}`);
     } catch (err) {
       console.error("[WA] Error sending message:", err);
-      // If sending fails, we can also notify the frontend
-      // Note: 'data.tempId' is available here from the initial destructuring
       socket.emit("send_message_error", {
         tempId: data.tempId,
         error: "Failed to send message.",
