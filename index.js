@@ -74,6 +74,37 @@ app.get('/media-test', (req, res) => {
   });
 });
 
+// Force reset endpoint
+app.post('/force-reset', async (req, res) => {
+  try {
+    console.log("[API] Force reset requested");
+    
+    if (client) {
+      await client.destroy();
+    }
+    
+    await fs.rm(AUTH_FOLDER_PATH, { recursive: true, force: true });
+    
+    client = null;
+    isClientReady = false;
+    clientInitialized = false;
+    lastQrDataUrl = null;
+    
+    res.json({ 
+      status: 'success', 
+      message: 'Client state reset successfully',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("[API] Force reset error:", error);
+    res.status(500).json({ 
+      status: 'error', 
+      message: 'Failed to reset client state',
+      error: error.message 
+    });
+  }
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { 
@@ -125,6 +156,25 @@ function setupClientEventHandlers() {
     console.log("[WA] Authenticated");
     io.emit("status", "authenticated");
     lastQrDataUrl = null; // Clear QR after successful auth
+    
+    // Add a timeout to detect if client gets stuck after authentication
+    setTimeout(() => {
+      if (!isClientReady) {
+        console.warn("[WA] Client stuck after authentication, attempting to reinitialize...");
+        io.emit("status", "auth_timeout");
+        
+        // Try to reinitialize the client
+        if (client) {
+          client.destroy().then(() => {
+            console.log("[WA] Destroyed stuck client, creating new instance...");
+            createClientInstance();
+            initializeClientIfNeeded();
+          }).catch(err => {
+            console.error("[WA] Error destroying stuck client:", err);
+          });
+        }
+      }
+    }, 30000); // 30 second timeout
   });
 
   client.on("ready", async () => {
@@ -152,6 +202,16 @@ function setupClientEventHandlers() {
     }
   });
 
+  // Add auth_failure handler
+  client.on("auth_failure", (msg) => {
+    console.error("[WA] Authentication failed:", msg);
+    isClientReady = false;
+    clientInitialized = false;
+    lastQrDataUrl = null;
+    io.emit("status", "auth_failure");
+    io.emit("error-message", "Authentication failed. Please try scanning again.");
+  });
+
   client.on("disconnected", async (reason) => {
     console.warn("[WA] disconnected:", reason);
 
@@ -176,10 +236,8 @@ function setupClientEventHandlers() {
     io.emit("status", "disconnected");
     io.emit("logged_out");
 
-    setTimeout(() => {
-      createClientInstance();
-      initializeClientIfNeeded();
-    }, 700);
+    // Don't auto-reinitialize on disconnect - let user manually trigger
+    console.log("[WA] Waiting for manual reinitialization...");
   });
 
   client.on("message_ack", (msg, ack) => {
@@ -251,8 +309,21 @@ function createClientInstance() {
     authStrategy: new LocalAuth({ dataPath: AUTH_FOLDER_PATH }),
     puppeteer: {
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: [
+        "--no-sandbox", 
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+        "--disable-gpu"
+      ],
     },
+    webVersion: '2.2402.5',
+    webVersionCache: {
+      type: 'local'
+    }
   });
 
   setupClientEventHandlers();
@@ -281,7 +352,18 @@ async function initializeClientIfNeeded() {
   } catch (err) {
     console.error("[WA] Error during client.initialize()", err);
     clientInitialized = false;
-    io.emit("error-message", "Failed to initialize WhatsApp client");
+    
+    // If initialization fails, reset the client state
+    if (client) {
+      try {
+        await client.destroy();
+      } catch (destroyErr) {
+        console.error("[WA] Error destroying client after failed init:", destroyErr);
+      }
+      client = null;
+    }
+    
+    io.emit("error-message", "Failed to initialize WhatsApp client. Please try again.");
   } finally {
     isInitializing = false;
   }
@@ -393,6 +475,25 @@ io.on("connection", (socket) => {
 
   socket.on("start-session", async () => {
     console.log("[IO] start-session requested by", socket.id);
+    
+    // Reset client state if it exists but is not ready
+    if (client && !isClientReady) {
+      console.log("[IO] Resetting existing client...");
+      try {
+        await client.destroy();
+      } catch (err) {
+        console.error("[IO] Error destroying existing client:", err);
+      }
+      client = null;
+      clientInitialized = false;
+    }
+    
+    // Create new client instance if needed
+    if (!client) {
+      console.log("[IO] Creating new client instance...");
+      createClientInstance();
+    }
+    
     await initializeClientIfNeeded();
   });
 
@@ -585,10 +686,55 @@ io.on("connection", (socket) => {
     io.emit("logged_out");
     io.emit("status", "disconnected");
 
-    setTimeout(() => {
-      createClientInstance();
-      initializeClientIfNeeded();
-    }, 700);
+    // Don't auto-reinitialize on manual logout - let user manually trigger
+    console.log("[SYS] Manual logout completed. Waiting for user to start new session.");
+  });
+
+  socket.on("force-reset", async () => {
+    console.log("[IO] force-reset requested by", socket.id);
+    try {
+      if (client) {
+        await client.destroy();
+      }
+      await fs.rm(AUTH_FOLDER_PATH, { recursive: true, force: true });
+      
+      client = null;
+      isClientReady = false;
+      clientInitialized = false;
+      lastQrDataUrl = null;
+      
+      socket.emit("force-reset-success", { message: "Client state reset successfully" });
+      io.emit("status", "disconnected");
+      io.emit("logged_out");
+      
+      console.log("[IO] Force reset completed successfully");
+    } catch (err) {
+      console.error("[IO] Force reset error:", err);
+      socket.emit("force-reset-error", { error: "Failed to reset client state" });
+    }
+  });
+
+  socket.on("retry-authentication", async () => {
+    console.log("[IO] retry-authentication requested by", socket.id);
+    try {
+      if (client && !isClientReady) {
+        console.log("[IO] Client exists but not ready, destroying and recreating...");
+        await client.destroy();
+        client = null;
+        clientInitialized = false;
+      }
+      
+      if (!client) {
+        console.log("[IO] Creating new client instance for retry...");
+        createClientInstance();
+      }
+      
+      await initializeClientIfNeeded();
+      socket.emit("retry-authentication-success", { message: "Authentication retry initiated" });
+    } catch (err) {
+      console.error("[IO] Retry authentication error:", err);
+      socket.emit("retry-authentication-error", { error: "Failed to retry authentication" });
+    }
   });
 
   socket.on("disconnect", () => {
